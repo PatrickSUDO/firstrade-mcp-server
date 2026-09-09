@@ -172,11 +172,21 @@ def _harden_profile_perms() -> None:
     """Best-effort: the saved session (cookies/tokens) should not be group/world
     readable on a shared machine. The `firstrade` package controls how PROFILE is
     written, so we just tighten perms after the fact; failures are non-fatal."""
+    # PROFILE is a *directory* (the firstrade package writes ft_cookies<user>.json
+    # inside it). A directory chmod'd to 0600 loses its execute bit, after which the
+    # owner can't stat/read anything inside — that's exactly how the 2026-09-09
+    # self-lockout happened (every auto re-auth re-broke it). Dirs get 0700, files 0600.
     try:
-        if os.path.exists(PROFILE):
+        if os.path.isdir(PROFILE):
+            os.chmod(PROFILE, stat.S_IRWXU)
+            for name in os.listdir(PROFILE):
+                p = os.path.join(PROFILE, name)
+                if os.path.isfile(p):
+                    os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
+        elif os.path.exists(PROFILE):
             os.chmod(PROFILE, stat.S_IRUSR | stat.S_IWUSR)
         parent = os.path.dirname(PROFILE)
-        if parent and os.path.exists(parent):
+        if parent and os.path.isdir(parent):
             os.chmod(parent, stat.S_IRWXU)
     except OSError:
         pass
@@ -333,28 +343,48 @@ def _exp_date(raw: str) -> str:
 
 
 @mcp.tool()
-def get_option_chain(symbol: str, exp_date: str = "") -> str:
+def get_option_chain(symbol: str, exp_date: str = "",
+                     strike_min: float = 0.0, strike_max: float = 0.0) -> str:
     """Get the broker's own option chain for a stock symbol.
 
     Args:
         symbol: Underlying ticker, e.g. 'NVDA'.
         exp_date: Expiration as 'YYYYMMDD' (or 'YYYY-MM-DD'). Omit to list the
             available expiration dates instead of returning a chain.
+        strike_min / strike_max: Optional inclusive strike filter (0 = no bound).
+            Full chains on NVDA/MU/CRWD exceed the MCP result-size cap (~100-140k
+            chars); pass a band around spot (e.g. ±15%) to keep the payload small.
 
     Returns JSON: {"items": [{exp_date, day_left, exp_type}, ...]} when exp_date is
-    omitted, else the chain for that expiration.
+    omitted, else the chain for that expiration (filtered if bounds given).
     """
     session, _ = _get_data()
     from firstrade import urls
     if not exp_date:
         resp = session._request("get", url=urls.option_dates(symbol))
-    else:
-        resp = session._request("get", url=urls.option_quotes(symbol, _exp_date(exp_date)))
-    return json.dumps(resp.json(), ensure_ascii=False)
+        return json.dumps(resp.json(), ensure_ascii=False)
+    resp = session._request("get", url=urls.option_quotes(symbol, _exp_date(exp_date)))
+    data = resp.json()
+    if (strike_min or strike_max) and isinstance(data, dict) and isinstance(data.get("items"), list):
+        lo = strike_min or float("-inf")
+        hi = strike_max or float("inf")
+        kept = []
+        for it in data["items"]:
+            try:
+                k = float(it.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            if lo <= k <= hi:
+                kept.append(it)
+        data["items"] = kept
+        data["strike_filter"] = {"min": strike_min or None, "max": strike_max or None,
+                                 "kept": len(kept)}
+    return json.dumps(data, ensure_ascii=False)
 
 
 @mcp.tool()
-def get_option_greeks(symbol: str, exp_date: str) -> str:
+def get_option_greeks(symbol: str, exp_date: str,
+                      strike_min: float = 0.0, strike_max: float = 0.0) -> str:
     """Get broker-computed greeks (delta/gamma/theta/vega/rho, IV) for an option chain.
 
     Prefer this over locally derived greeks when sizing or comparing legs.
@@ -363,6 +393,8 @@ def get_option_greeks(symbol: str, exp_date: str) -> str:
         symbol: Underlying ticker, e.g. 'TSLA'.
         exp_date: Expiration as 'YYYYMMDD' (or 'YYYY-MM-DD'). Get valid dates from
             get_option_chain with exp_date omitted.
+        strike_min / strike_max: Optional inclusive strike filter (0 = no bound);
+            full greeks on liquid names exceed the MCP result-size cap.
 
     Returns JSON {"chains": [{strike, cp, side, symbol, iv, delta, gamma, rho,
     theta, vega}, ...]}. Illiquid strikes report "--" rather than a number.
@@ -376,7 +408,22 @@ def get_option_greeks(symbol: str, exp_date: str) -> str:
         "exp_date": _exp_date(exp_date),
     }
     resp = session._request("post", url=urls.greek_options(), data=payload)
-    return json.dumps(resp.json(), ensure_ascii=False)
+    data = resp.json()
+    if (strike_min or strike_max) and isinstance(data, dict) and isinstance(data.get("chains"), list):
+        lo = strike_min or float("-inf")
+        hi = strike_max or float("inf")
+        kept = []
+        for it in data["chains"]:
+            try:
+                k = float(it.get("strike"))
+            except (TypeError, ValueError):
+                continue
+            if lo <= k <= hi:
+                kept.append(it)
+        data["chains"] = kept
+        data["strike_filter"] = {"min": strike_min or None, "max": strike_max or None,
+                                 "kept": len(kept)}
+    return json.dumps(data, ensure_ascii=False)
 
 
 # ── Order tools ──────────────────────────────────────────────────────────────

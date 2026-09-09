@@ -165,8 +165,18 @@ def step2(code=None):
     s._save_cookies()
 
     os.makedirs(os.path.dirname(PROFILE) if os.path.dirname(PROFILE) else ".", exist_ok=True)
+    # PROFILE is a directory (firstrade writes ft_cookies<user>.json inside it).
+    # Never chmod a directory to 0600 — it strips the execute bit and locks the
+    # owner out of its own session files (2026-09-09 incident). Dir 0700, files 0600.
     try:
-        os.chmod(PROFILE, stat.S_IRUSR | stat.S_IWUSR)
+        if os.path.isdir(PROFILE):
+            os.chmod(PROFILE, stat.S_IRWXU)
+            for name in os.listdir(PROFILE):
+                p = os.path.join(PROFILE, name)
+                if os.path.isfile(p):
+                    os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
+        else:
+            os.chmod(PROFILE, stat.S_IRUSR | stat.S_IWUSR)
         os.chmod(os.path.dirname(PROFILE), stat.S_IRWXU)
     except OSError:
         pass
