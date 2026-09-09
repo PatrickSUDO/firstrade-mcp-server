@@ -16,9 +16,6 @@ env/
 .env.*
 !.env.example
 
-# UV / pip
-uv.lock
-
 # Firstrade session cache / probe run artifacts (may echo positions, order state)
 tools/probe-out/
 *firstrade-session*

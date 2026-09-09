@@ -12,12 +12,30 @@ Headless (requires FT_TOTP_SECRET = authenticator-app seed in .env):
 The `auto` path is what launchd / the daily briefing should call to self-heal a
 session before it 401s.
 """
-import sys, os, json, requests
+import sys, os, json, stat, requests
 from firstrade.account import FTSession, FTAccountData
 from firstrade import urls
 
-STATE_FILE = "/tmp/ft_auth_state.json"
+# Not /tmp: that's world-readable on most multi-user machines, and this file
+# briefly holds a live t_token + session cookies mid-login-flow.
+STATE_DIR  = os.path.expanduser("~/.local/share/firstrade-session-tmp")
+STATE_FILE = os.path.join(STATE_DIR, "auth_state.json")
 PROFILE    = os.path.expanduser("~/.local/share/firstrade-session")
+
+
+def _redact(value, keep=4):
+    """Show shape/presence, never the secret itself, in anything that might hit a
+    terminal, log file, or (via server.py's re-auth error path) an MCP response."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return {k: _redact(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+    s = str(value)
+    if len(s) <= keep * 2:
+        return "***"
+    return f"{s[:keep]}…redacted({len(s)})…{s[-keep:]}"
 
 
 def _load_env():
@@ -71,7 +89,7 @@ def step1():
                       data={"username": USERNAME, "password": PASSWORD})
     login_json = resp.json()
     t_token = login_json.get("t_token")
-    print("Login response:", login_json)
+    print("Login response:", _redact(login_json))
 
     otp_options = login_json.get("otp")
     if otp_options:
@@ -86,14 +104,14 @@ def step1():
             otp_resp = s._request("post", url=urls.request_code(),
                                   data={"recipientId": recipient_id, "t_token": t_token})
             otp_json = otp_resp.json()
-            print("OTP request result:", otp_json)
+            print("OTP request result:", _redact(otp_json))
             verification_sid = otp_json.get("verificationSid", "")
         else:
             verification_sid = login_json.get("verificationSid", "")
     else:
         verification_sid = login_json.get("verificationSid", "")
 
-    # Save state
+    # Save state — private dir/file perms since this holds a live t_token + cookies.
     state = {
         "headers": dict(s.session.headers),
         "cookies": requests.utils.dict_from_cookiejar(s.session.cookies),
@@ -101,7 +119,10 @@ def step1():
         "verification_sid": verification_sid,
         "mfa": login_json.get("mfa", False),
     }
-    with open(STATE_FILE, "w") as f:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    os.chmod(STATE_DIR, stat.S_IRWXU)
+    fd = os.open(STATE_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+    with os.fdopen(fd, "w") as f:
         json.dump(state, f)
 
     print("✅ OTP sent. Run step2 with the code:")
@@ -133,7 +154,7 @@ def step2(code=None):
 
     resp = s._request("post", url=urls.verify_pin(), data=data)
     result = resp.json()
-    print("Verify result:", result)
+    print("Verify result:", _redact(result))
 
     if result.get("error"):
         print("❌ Error:", result["error"])
@@ -144,6 +165,15 @@ def step2(code=None):
     s._save_cookies()
 
     os.makedirs(os.path.dirname(PROFILE) if os.path.dirname(PROFILE) else ".", exist_ok=True)
+    try:
+        os.chmod(PROFILE, stat.S_IRUSR | stat.S_IWUSR)
+        os.chmod(os.path.dirname(PROFILE), stat.S_IRWXU)
+    except OSError:
+        pass
+    try:
+        os.remove(STATE_FILE)  # mid-flow t_token/cookies no longer needed once PROFILE is saved
+    except OSError:
+        pass
 
     d = FTAccountData(s)
     print("✅ Authentication complete!")

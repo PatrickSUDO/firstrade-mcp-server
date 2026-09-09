@@ -20,9 +20,11 @@ Python package, which reverse-engineers Firstrade's internal `api3x` web API.
   or suspended.** Use at your own risk, on an account you're prepared to lose access to.
 - The order-placement tools (`place_stock_order`, `place_option_order`,
   `place_option_spread`) send **real orders with real money**. There is no
-  simulated/paper mode. Always call the matching `preview_*` tool first — it runs
-  the same request with `dry_run=True` and returns Firstrade's own preview
-  confirmation (est. cost, margin impact, etc.) without executing anything.
+  simulated/paper mode. This is enforced server-side, not just by convention:
+  `place_*` is disabled unless `FT_ALLOW_LIVE_ORDERS=true` is set in `.env`, and
+  every call additionally requires a `confirm_token` minted by the matching
+  `preview_*` tool for the *identical* order — a mismatched or missing token is
+  rejected before anything is sent. See [Live order safety model](#live-order-safety-model).
 - This is a personal tool the author built for their own workflow and is sharing
   as-is. It is not a product, has no support SLA, and comes with **no warranty of
   any kind** (see [LICENSE](LICENSE)). Nothing here is investment advice.
@@ -52,7 +54,37 @@ credentials in `.env`.
 Every `place_*` tool has a matching `preview_*` tool that runs the identical
 request in dry-run mode. The intended usage pattern for an LLM host is:
 **always preview first, show the user the preview, only place after explicit
-confirmation.**
+confirmation** — and the server enforces this, it doesn't just document it (see
+below).
+
+## Live order safety model
+
+`place_stock_order`, `place_option_order`, and `place_option_spread` are gated
+by two independent checks, both server-side:
+
+1. **Kill switch.** They refuse to run unless `FT_ALLOW_LIVE_ORDERS=true` is set
+   in `.env`. Unset (the default) or anything else, and every `place_*` call
+   returns an error without touching the network — `preview_*` still works, so
+   you can wire this up and see previews before ever flipping the switch.
+2. **Preview→place confirmation token.** Every `preview_*` call mints a one-time
+   `confirm_token` bound to the exact order arguments (symbol, side, quantity,
+   price, duration, etc.), valid for 10 minutes. The matching `place_*` call
+   must pass that token back unchanged. A missing token, an expired token, or a
+   token minted for *different* order arguments (e.g. the LLM previewed 10
+   shares but tries to place 100) is rejected before the order reaches
+   Firstrade. Tokens live in-process only — a server restart invalidates every
+   pending preview.
+
+This closes the gap where "preview first" was only a docstring instruction an
+LLM host could skip or a permissions layer could bypass; now placing an order
+that was never (or differently) previewed is impossible at the code level.
+
+Two more things worth knowing:
+- `duration` on stock orders defaults to `gt90` (Firstrade's ~90-day GTC), which
+  the confirm-token flow forces you to see in the preview before it can be sent.
+  Pass `duration="day"` explicitly if you don't want a resting GTC order.
+- If your login has more than one Firstrade account, order/quote/cancel tools
+  refuse to guess which one you mean — set `FT_ACCOUNT_NUMBER` in `.env`.
 
 See [`docs/option-order-api.md`](docs/option-order-api.md) for the reverse-engineered
 schema of Firstrade's single-leg and multi-leg option order endpoints (error
@@ -73,6 +105,7 @@ cd firstrade-mcp-server
 uv sync
 cp .env.example .env
 # edit .env: fill in FT_USERNAME, FT_PASSWORD, FT_PIN, FT_EMAIL
+# leave FT_ALLOW_LIVE_ORDERS unset until you've reviewed the safety model below
 ```
 
 ### First login (interactive)
@@ -133,6 +166,20 @@ to (and shouldn't) put them in the MCP host config.
 - No credentials are hardcoded anywhere in the source. `server.py` and
   `tools/ft_setup.py` both load `FT_*` values from a local `.env` file that is
   git-ignored.
+- `FT_TOTP_SECRET`, if you set it, is your authenticator's full seed — not a
+  6-digit code. Anyone with it (or with your `.env`) can mint valid login codes
+  for your account indefinitely, no phone required. Treat `.env` like a
+  password, not a config file: `chmod 600` it, don't sync it anywhere shared.
+- The saved session (`~/.local/share/firstrade-session`) and the transient
+  login-flow state (`~/.local/share/firstrade-session-tmp/`) hold live cookies
+  / tokens. Both are written with `0600`/`0700` perms and kept out of `/tmp`
+  (which is world-readable on most multi-user machines). `ft_setup.py` also
+  never prints raw tokens/cookies to stdout — only redacted shapes — since a
+  failed headless re-auth surfaces its tail through the MCP error channel.
+- `uv.lock` is committed and `firstrade` is pinned to an exact version, not a
+  floating `>=`. This wraps an unofficial, reverse-engineered API client that
+  runs against a live brokerage account — bump it deliberately, after testing,
+  not automatically on `uv sync`.
 - `tools/probe-out/` (raw API responses captured while reverse-engineering the
   option order schema) is git-ignored too — even though account numbers in
   those responses are masked by Firstrade itself, it's still your own live

@@ -4,6 +4,9 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "mcp[cli]>=1.6.0",
-    "firstrade>=0.0.39",
+    # Pinned exact: this is a reverse-engineered, unofficial client for Firstrade's
+    # private API — a malicious or broken release could execute against a live
+    # brokerage account. Bump deliberately (test, then re-pin), never on a float.
+    "firstrade==0.0.39",
     "pyotp>=2.9.0",
 ]

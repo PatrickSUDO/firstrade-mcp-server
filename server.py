@@ -1,6 +1,10 @@
 import os
+import re
 import sys
 import json
+import time
+import uuid
+import stat
 import subprocess
 from mcp.server.fastmcp import FastMCP
 from firstrade.account import FTSession, FTAccountData
@@ -30,11 +34,97 @@ PASSWORD = os.environ.get("FT_PASSWORD", "")
 PIN      = os.environ.get("FT_PIN", "")
 EMAIL    = os.environ.get("FT_EMAIL", "")
 TOTP_SECRET = os.environ.get("FT_TOTP_SECRET", "")  # enables headless self-heal
+ACCOUNT_OVERRIDE = os.environ.get("FT_ACCOUNT_NUMBER", "").strip()  # required if >1 account
+ALLOW_LIVE_ORDERS = os.environ.get("FT_ALLOW_LIVE_ORDERS", "").strip().lower() in ("1", "true", "yes")
 PROFILE  = os.path.expanduser("~/.local/share/firstrade-session")
 _FT_SETUP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "ft_setup.py")
 
 _session: FTSession | None = None
 _data: FTAccountData | None = None
+
+# ── Preview→place confirmation tokens ───────────────────────────────────────
+# A place_* call must reference a token minted by the matching preview_* call for
+# the *exact same* order (same tool, same canonicalized args). This turns "only
+# call place_* after the user confirms the preview" from a docstring convention
+# an LLM host can skip into something the server itself enforces. Tokens are
+# single-use and expire after 10 minutes; in-memory only (process-lifetime), so
+# a server restart invalidates all pending previews — that's intentional.
+_PREVIEW_TTL_SECONDS = 600
+_previews: dict[str, tuple[str, str]] = {}  # token -> (tool_name, canonical_args_json)
+
+
+def _canon_args(**kwargs) -> str:
+    return json.dumps(kwargs, sort_keys=True, default=str)
+
+
+def _mint_preview_token(tool_name: str, **kwargs) -> str:
+    now = time.time()
+    # opportunistic sweep of expired tokens so the dict doesn't grow unbounded
+    for tok in [t for t, (exp, _) in _previews.items() if now > float(exp)]:
+        del _previews[tok]
+    token = uuid.uuid4().hex
+    _previews[token] = (str(now + _PREVIEW_TTL_SECONDS), f"{tool_name}:{_canon_args(**kwargs)}")
+    return token
+
+
+def _check_preview_token(tool_name: str, token: str, **kwargs) -> str | None:
+    """Returns an error string if the token is missing/expired/mismatched, else None
+    (and consumes the token — one preview authorizes exactly one place)."""
+    entry = _previews.pop(token, None) if token else None
+    if entry is None:
+        return (
+            "No matching preview found for confirm_token. Call the matching preview_* "
+            "tool first with the exact same arguments, then pass the token it returns "
+            "as confirm_token."
+        )
+    expiry_s, recorded = entry
+    if time.time() > float(expiry_s):
+        return "confirm_token expired (previews are valid for 10 minutes) — preview again."
+    expected = f"{tool_name}:{_canon_args(**kwargs)}"
+    if recorded != expected:
+        return "confirm_token was minted for different order arguments — preview again with the exact order you intend to place."
+    return None
+
+
+def _require_live_orders_enabled() -> str | None:
+    if not ALLOW_LIVE_ORDERS:
+        return (
+            "Live order placement is disabled. Set FT_ALLOW_LIVE_ORDERS=true in "
+            "firstrade-server/.env to enable place_* tools. This is an explicit "
+            "opt-in kill switch — leave it off unless you intend to send real orders."
+        )
+    return None
+
+
+_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_\-\.]{24,}")
+
+
+def _scrub(text: str) -> str:
+    """Mask long token/cookie-shaped substrings before any subprocess output is
+    surfaced through the MCP error channel (session tokens, ftat, sid, cookies)."""
+    return _SECRET_PATTERN.sub(lambda m: m.group(0)[:4] + "…redacted…" + m.group(0)[-4:], text)
+
+
+def _select_account(data: FTAccountData) -> tuple[str | None, str | None]:
+    """Pick the account order/quote/cancel tools operate on. Never silently default
+    to accounts[0] when more than one account exists — that's a fat-finger risk on
+    a multi-account login. Returns (acct, error_json); exactly one is non-None."""
+    if not data.account_numbers:
+        return None, json.dumps({"error": "No account found"})
+    if ACCOUNT_OVERRIDE:
+        if ACCOUNT_OVERRIDE not in data.account_numbers:
+            return None, json.dumps({
+                "error": f"FT_ACCOUNT_NUMBER={ACCOUNT_OVERRIDE!r} not found among accounts",
+                "accounts": data.account_numbers,
+            })
+        return ACCOUNT_OVERRIDE, None
+    if len(data.account_numbers) > 1:
+        return None, json.dumps({
+            "error": "Multiple Firstrade accounts found and FT_ACCOUNT_NUMBER is not set.",
+            "accounts": data.account_numbers,
+            "fix": "Set FT_ACCOUNT_NUMBER in firstrade-server/.env to the account these tools should use.",
+        })
+    return data.account_numbers[0], None
 
 
 _REFRESH_HINT = (
@@ -74,8 +164,22 @@ def _auto_mint() -> None:
         cwd=os.path.dirname(_FT_SETUP),
     )
     if r.returncode != 0:
-        tail = (r.stderr or r.stdout or "")[-600:]
+        tail = _scrub((r.stderr or r.stdout or "")[-600:])
         raise RuntimeError(f"Firstrade auto re-auth failed (exit {r.returncode}).\n{tail}\n" + _REFRESH_HINT)
+
+
+def _harden_profile_perms() -> None:
+    """Best-effort: the saved session (cookies/tokens) should not be group/world
+    readable on a shared machine. The `firstrade` package controls how PROFILE is
+    written, so we just tighten perms after the fact; failures are non-fatal."""
+    try:
+        if os.path.exists(PROFILE):
+            os.chmod(PROFILE, stat.S_IRUSR | stat.S_IWUSR)
+        parent = os.path.dirname(PROFILE)
+        if parent and os.path.exists(parent):
+            os.chmod(parent, stat.S_IRWXU)
+    except OSError:
+        pass
 
 
 def _build_session() -> tuple[FTSession | None, FTAccountData | None]:
@@ -90,6 +194,7 @@ def _build_session() -> tuple[FTSession | None, FTAccountData | None]:
         )
         if session.login():  # True → OTP required / no reusable saved session
             return None, None
+        _harden_profile_perms()
         return session, FTAccountData(session)
     except Exception:
         return None, None    # any failure building from saved session → re-mint
@@ -199,9 +304,9 @@ def get_orders(per_page: int = 0) -> str:
 def get_single_quote(symbol: str) -> str:
     """Get real-time quote for a stock symbol."""
     session, data = _get_data()
-    if not data.account_numbers:
-        return json.dumps({"error": "No account found"})
-    acct = data.account_numbers[0]
+    acct, err = _select_account(data)
+    if err:
+        return err
     from firstrade import urls
     resp = session._request("get", urls.quote(acct, symbol))
     return json.dumps(resp.json(), ensure_ascii=False)
@@ -211,9 +316,9 @@ def get_single_quote(symbol: str) -> str:
 def get_watchlist_quote(symbols: str) -> str:
     """Get real-time quotes for multiple symbols (comma-separated, e.g. 'AAPL,NVDA,MU')."""
     session, data = _get_data()
-    if not data.account_numbers:
-        return json.dumps({"error": "No account found"})
-    acct = data.account_numbers[0]
+    acct, err = _select_account(data)
+    if err:
+        return err
     from firstrade import urls
     results = {}
     for sym in [s.strip() for s in symbols.split(",")]:
@@ -329,9 +434,9 @@ def _stock_order(
     dry_run: bool,
 ) -> str:
     session, data = _get_data()
-    if not data.account_numbers:
-        return json.dumps({"error": "No account found"})
-    acct = data.account_numbers[0]
+    acct, err = _select_account(data)
+    if err:
+        return err
 
     ot = _ORDER_TYPES_STOCK.get(order_type.lower())
     if ot is None:
@@ -370,9 +475,9 @@ def _option_order(
     dry_run: bool,
 ) -> str:
     session, data = _get_data()
-    if not data.account_numbers:
-        return json.dumps({"error": "No account found"})
-    acct = data.account_numbers[0]
+    acct, err = _select_account(data)
+    if err:
+        return err
 
     ot = _ORDER_TYPES_OPTION.get(order_type.lower())
     if ot is None:
@@ -456,9 +561,17 @@ def preview_stock_order(
         price: Limit price (required for limit/stop_limit orders).
         stop_price: Stop trigger price (required for stop/stop_limit orders).
 
-    Returns JSON with order preview confirmation data. Show this to the user before placing.
+    Returns JSON with order preview confirmation data, plus "confirm_token": pass
+    that token unchanged to place_stock_order (with the identical order arguments)
+    to actually send it. The token expires in 10 minutes and works once.
     """
-    return _stock_order(symbol, order_type, quantity, price_type, duration, price, stop_price, dry_run=True)
+    result = json.loads(_stock_order(symbol, order_type, quantity, price_type, duration, price, stop_price, dry_run=True))
+    if isinstance(result, dict) and not result.get("error"):
+        result["confirm_token"] = _mint_preview_token(
+            "stock", symbol=symbol, order_type=order_type, quantity=quantity,
+            price_type=price_type, duration=duration, price=price, stop_price=stop_price,
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -466,17 +579,22 @@ def place_stock_order(
     symbol: str,
     order_type: str,
     quantity: int,
+    confirm_token: str,
     price_type: str = "limit",
     duration: str = "gt90",
     price: float = 0.0,
     stop_price: float | None = None,
 ) -> str:
-    """Place a real stock order (dry_run=False). ONLY call after user explicitly confirms preview.
+    """Place a real stock order (dry_run=False). Requires FT_ALLOW_LIVE_ORDERS=true in
+    .env AND a confirm_token from preview_stock_order called with these exact same
+    arguments — the server rejects the order otherwise, it does not just rely on the
+    caller having "meant to" preview first.
 
     Args:
         symbol: Ticker symbol (e.g. 'NVDA').
         order_type: buy | sell | sell_short | buy_to_cover
         quantity: Number of shares.
+        confirm_token: Token returned by preview_stock_order for this exact order.
         price_type: limit | market | stop | stop_limit | trailing_stop_dollar | trailing_stop_percent
         duration: day | day_ext | overnight | gt90 (gt90 ≈ GTC, 90-day)
         price: Limit price (required for limit/stop_limit orders).
@@ -484,6 +602,15 @@ def place_stock_order(
 
     Returns JSON with order confirmation. This sends a real order to Firstrade.
     """
+    gate_err = _require_live_orders_enabled()
+    if gate_err:
+        return json.dumps({"error": gate_err})
+    tok_err = _check_preview_token(
+        "stock", confirm_token, symbol=symbol, order_type=order_type, quantity=quantity,
+        price_type=price_type, duration=duration, price=price, stop_price=stop_price,
+    )
+    if tok_err:
+        return json.dumps({"error": tok_err})
     return _stock_order(symbol, order_type, quantity, price_type, duration, price, stop_price, dry_run=False)
 
 
@@ -511,9 +638,17 @@ def preview_option_order(
         price: Limit price per contract (required for limit orders).
         stop_price: Stop trigger price (required for stop/stop_limit orders).
 
-    Returns JSON with order preview confirmation data. Show this to the user before placing.
+    Returns JSON with order preview confirmation data, plus "confirm_token": pass
+    that token unchanged to place_option_order (with the identical order arguments)
+    to actually send it. The token expires in 10 minutes and works once.
     """
-    return _option_order(option_symbol, order_type, contracts, price_type, duration, price, stop_price, dry_run=True)
+    result = json.loads(_option_order(option_symbol, order_type, contracts, price_type, duration, price, stop_price, dry_run=True))
+    if isinstance(result, dict) and not result.get("error"):
+        result["confirm_token"] = _mint_preview_token(
+            "option", option_symbol=option_symbol, order_type=order_type, contracts=contracts,
+            price_type=price_type, duration=duration, price=price, stop_price=stop_price,
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -521,12 +656,16 @@ def place_option_order(
     option_symbol: str,
     order_type: str,
     contracts: int,
+    confirm_token: str,
     price_type: str = "limit",
     duration: str = "day",
     price: float = 0.0,
     stop_price: float | None = None,
 ) -> str:
-    """Place a real option order (dry_run=False). ONLY call after user explicitly confirms preview.
+    """Place a real option order (dry_run=False). Requires FT_ALLOW_LIVE_ORDERS=true in
+    .env AND a confirm_token from preview_option_order called with these exact same
+    arguments — the server rejects the order otherwise, it does not just rely on the
+    caller having "meant to" preview first.
 
     Args:
         option_symbol: OCC format symbol (e.g. 'AAPL250620C00150000').
@@ -535,6 +674,7 @@ def place_option_order(
             MUST use sell_to_close, otherwise Firstrade treats it as opening a short
             and rejects with ref 1103).
         contracts: Number of contracts.
+        confirm_token: Token returned by preview_option_order for this exact order.
         price_type: limit | market | stop | stop_limit
         duration: day | day_ext | gt90
         price: Limit price per contract (required for limit orders).
@@ -542,6 +682,15 @@ def place_option_order(
 
     Returns JSON with order confirmation. This sends a real order to Firstrade.
     """
+    gate_err = _require_live_orders_enabled()
+    if gate_err:
+        return json.dumps({"error": gate_err})
+    tok_err = _check_preview_token(
+        "option", confirm_token, option_symbol=option_symbol, order_type=order_type, contracts=contracts,
+        price_type=price_type, duration=duration, price=price, stop_price=stop_price,
+    )
+    if tok_err:
+        return json.dumps({"error": tok_err})
     return _option_order(option_symbol, order_type, contracts, price_type, duration, price, stop_price, dry_run=False)
 
 
@@ -593,9 +742,9 @@ def _spread_order(
     limit_type: str, net_price: float, dry_run: bool,
 ) -> str:
     session, data = _get_data()
-    if not data.account_numbers:
-        return json.dumps({"error": "No account found"})
-    acct = data.account_numbers[0]
+    acct, err = _select_account(data)
+    if err:
+        return err
     t1 = _ORDER_TYPES_OPTION.get(transaction1.lower())
     t2 = _ORDER_TYPES_OPTION.get(transaction2.lower())
     if t1 is None or t2 is None:
@@ -633,10 +782,19 @@ def preview_option_spread(
         contracts1 / contracts2: Contracts per leg (default 1 each).
 
     Notes: complex orders are DAY only (no GTC) and accepted by Firstrade only 7AM–4PM ET
-    (ref 1110 otherwise). Returns JSON preview; show it to the user before placing.
+    (ref 1110 otherwise). Returns JSON preview plus "confirm_token": pass that token
+    unchanged to place_option_spread (with the identical arguments) to actually send
+    it. The token expires in 10 minutes and works once.
     """
-    return _spread_order(symbol1, transaction1, contracts1, symbol2, transaction2, contracts2,
-                         limit_type, net_price, dry_run=True)
+    result = json.loads(_spread_order(symbol1, transaction1, contracts1, symbol2, transaction2, contracts2,
+                         limit_type, net_price, dry_run=True))
+    if isinstance(result, dict) and not result.get("error"):
+        result["confirm_token"] = _mint_preview_token(
+            "spread", symbol1=symbol1, transaction1=transaction1, contracts1=contracts1,
+            symbol2=symbol2, transaction2=transaction2, contracts2=contracts2,
+            limit_type=limit_type, net_price=net_price,
+        )
+    return json.dumps(result, ensure_ascii=False)
 
 
 @mcp.tool()
@@ -647,14 +805,29 @@ def place_option_spread(
     transaction2: str,
     limit_type: str,
     net_price: float,
+    confirm_token: str,
     contracts1: int = 1,
     contracts2: int = 1,
 ) -> str:
-    """Place a real two-leg option spread (dry_run=False). ONLY call after user explicitly confirms preview.
+    """Place a real two-leg option spread (dry_run=False). Requires FT_ALLOW_LIVE_ORDERS=true
+    in .env AND a confirm_token from preview_option_spread called with these exact same
+    arguments — the server rejects the order otherwise, it does not just rely on the
+    caller having "meant to" preview first.
 
-    Same arguments as preview_option_spread. DAY order only; 7AM–4PM ET window.
-    Returns JSON with order confirmation. This sends a real order to Firstrade.
+    Same arguments as preview_option_spread, plus confirm_token. DAY order only;
+    7AM–4PM ET window. Returns JSON with order confirmation. This sends a real
+    order to Firstrade.
     """
+    gate_err = _require_live_orders_enabled()
+    if gate_err:
+        return json.dumps({"error": gate_err})
+    tok_err = _check_preview_token(
+        "spread", confirm_token, symbol1=symbol1, transaction1=transaction1, contracts1=contracts1,
+        symbol2=symbol2, transaction2=transaction2, contracts2=contracts2,
+        limit_type=limit_type, net_price=net_price,
+    )
+    if tok_err:
+        return json.dumps({"error": tok_err})
     return _spread_order(symbol1, transaction1, contracts1, symbol2, transaction2, contracts2,
                          limit_type, net_price, dry_run=False)
 
@@ -669,9 +842,9 @@ def cancel_order(order_id: str) -> str:
     Returns JSON with cancellation result.
     """
     session, data = _get_data()
-    if not data.account_numbers:
-        return json.dumps({"error": "No account found"})
-    acct = data.account_numbers[0]
+    acct, err = _select_account(data)
+    if err:
+        return err
     from firstrade import urls
     resp = session._request("post", url=urls.cancel_order(), data={"order_id": order_id})
     return json.dumps(resp.json(), ensure_ascii=False)
